@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Vendite Pro</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" type="image/png" href="public/icon.png">
+<link rel="apple-touch-icon" href="public/icon.png">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { max-width: 100%; overflow-x: hidden; }
+  :root {
+    --bg:#0d0d0d; --surface:#1a1a1a; --surface2:#242424; --surface3:#2e2e2e;
+    --border:rgba(255,255,255,0.08); --border2:rgba(255,255,255,0.15);
+    --text:#f0f0f0; --muted:#888;
+    --accent:#00e68a; --accent-dim:rgba(0,230,138,0.12); --accent-dark:#00b36b;
+    --danger:#ff4d4d; --danger-dim:rgba(255,77,77,0.12);
+    --warning:#ffb800;
+    --blue:#4d9fff; --blue-dim:rgba(77,159,255,0.12);
+  }
+  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); min-height:100dvh; padding-bottom:4rem; }
+  #root { max-width:100vw; overflow-x:hidden; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes pulse { 0%,100% { opacity:.4; } 50% { opacity:.8; } }
+</style>
+<!-- React + Babel -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ─────────────────────────────────────────────
+// SECURITY: Validator
+// Centralizza tutte le validazioni input per
+// evitare injection, valori corrotti e spam.
+// ─────────────────────────────────────────────
+class Validator {
+  // [FIX 1] Solo URL https di script.google.com accettati
+  static isValidScriptUrl(url) {
+    try {
+      const u = new URL(url);
+      return u.protocol === 'https:' &&
+             u.hostname === 'script.google.com' &&
+             u.pathname.startsWith('/macros/s/');
+    } catch { return false; }
+  }
+
+  // [FIX 4] Prezzo/costo: numero >= 0, max 99999
+  static sanitizePrice(val) {
+    const n = parseFloat(val);
+    if (isNaN(n) || n < 0) return null;
+    return Math.min(n, 99999);
+  }
+
+  // [FIX 5] Buyer: solo testo, max 80 chars, niente caratteri URL-pericolosi
+  static sanitizeBuyer(val) {
+    return String(val).slice(0, 80).replace(/[<>"'`]/g, '');
+  }
+
+  // [FIX 5] Nome prodotto: max 100 chars, niente HTML
+  static sanitizeName(val) {
+    return String(val).trim().slice(0, 100).replace(/[<>"'`]/g, '');
+  }
+
+  // [FIX 3] Rate limiter: max N chiamate per intervallo
+  static _callLog = [];
+  static MAX_CALLS = 10;
+  static WINDOW_MS = 3000;
+  static checkRateLimit() {
+    const now = Date.now();
+    this._callLog = this._callLog.filter(t => now - t < this.WINDOW_MS);
+    if (this._callLog.length >= this.MAX_CALLS) return false;
+    this._callLog.push(now);
+    return true;
+  }
+}
+
+// ─────────────────────────────────────────────
+// OOP: Product model
+// ─────────────────────────────────────────────
+class Product {
+  constructor({ name, venduti, prezzo, costo, icon, row }) {
+    this.name    = Validator.sanitizeName(name || '');
+    this.venduti = Math.max(0, parseFloat(venduti) || 0);
+    this.prezzo  = Math.max(0, parseFloat(prezzo)  || 0);
+    this.costo   = Math.max(0, parseFloat(costo)   || 0);
+    this.icon    = (icon && String(icon).trim()) ? String(icon).trim() : '📦';
+    this.row     = parseInt(row) || 0;
+  }
+  get gross()  { return this.venduti * this.prezzo; }
+  get net()    { return this.venduti * (this.prezzo - this.costo); }
+  withVenduti(delta) {
+    return new Product({ ...this, venduti: Math.max(0, this.venduti + delta) });
+  }
+  toPlain() {
+    return { name:this.name, venduti:this.venduti, prezzo:this.prezzo, costo:this.costo, icon:this.icon, row:this.row };
+  }
+}
+
+// ─────────────────────────────────────────────
+// OOP: ProductStore (cache in localStorage)
+// ─────────────────────────────────────────────
+class ProductStore {
+  static KEY = 'vp_products_v2';
+  static URL_KEY = 'scriptUrl';
+
+  // [FIX 6] Valida ogni campo prima di accettare dati da localStorage
+  static _validate(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (typeof obj.name !== 'string') return false;
+    if (typeof obj.row !== 'number' || obj.row < 2) return false;
+    if (isNaN(parseFloat(obj.prezzo))) return false;
+    return true;
+  }
+
+  static load() {
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(this._validate).map(p => new Product(p));
+    } catch { return []; }
+  }
+
+  static save(products) {
+    try { localStorage.setItem(this.KEY, JSON.stringify(products.map(p => p.toPlain()))); } catch {}
+  }
+
+  static getUrl() {
+    const url = localStorage.getItem(this.URL_KEY) || '';
+    // [FIX 1+6] Non restituire mai URL non validi salvati in precedenza
+    return Validator.isValidScriptUrl(url) ? url : '';
+  }
+
+  static setUrl(url) {
+    if (!Validator.isValidScriptUrl(url)) throw new Error('URL non valido');
+    localStorage.setItem(this.URL_KEY, url);
+  }
+}
+
+// ─────────────────────────────────────────────
+// OOP: ApiService (JSONP + imgReq)
+// ─────────────────────────────────────────────
+class ApiService {
+  // [FIX 1] Verifica sempre che l'URL sia valido prima di fare richieste
+  static _assertUrl(url) {
+    if (!Validator.isValidScriptUrl(url)) throw new Error('URL script non autorizzato');
+  }
+
+  // [FIX 3] Verifica rate limit prima di ogni mutazione
+  static _assertRate() {
+    if (!Validator.checkRateLimit()) throw new Error('Troppe richieste. Attendi un momento.');
+  }
+
+  static jsonp(baseUrl, params = {}) {
+    this._assertUrl(baseUrl);
+    return new Promise((resolve, reject) => {
+      const name = 'cb_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      const scriptId = 's_' + name;
+      let done = false;
+
+      const cleanup = () => {
+        delete window[name];
+        document.getElementById(scriptId)?.remove();
+      };
+
+      window[name] = (data) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        // [FIX 2] Verifica che la risposta JSONP sia un array, non codice arbitrario
+        if (!Array.isArray(data)) { reject(new Error('Risposta JSONP non valida')); return; }
+        resolve(data);
+      };
+
+      const s = document.createElement('script');
+      s.id = scriptId;
+      s.onerror = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error('Script error'));
+      };
+
+      const qs = Object.entries({ ...params, callback: name })
+        .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+      s.src = `${baseUrl}?${qs}`;
+      document.head.appendChild(s);
+
+      setTimeout(() => {
+        if (!done) { done = true; cleanup(); reject(new Error('Timeout')); }
+      }, 9000);
+    });
+  }
+
+  static imgReq(url) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = img.onerror = resolve;
+      img.src = url + '&_t=' + Date.now();
+      setTimeout(resolve, 5000);
+    });
+  }
+
+  static async fetchProducts(baseUrl) {
+    this._assertUrl(baseUrl);
+    const data = await this.jsonp(baseUrl, { action: 'getProducts' });
+    return data.map(p => new Product(p));
+  }
+
+  static sell(baseUrl, row, qty, buyer = '') {
+    this._assertUrl(baseUrl);
+    this._assertRate();
+    // [FIX 5] Buyer sanitizzato
+    const safeBuyer = Validator.sanitizeBuyer(buyer);
+    let url = `${baseUrl}?action=sell&row=${row}&qty=${qty}`;
+    if (safeBuyer) url += `&buyer=${encodeURIComponent(safeBuyer)}`;
+    return this.imgReq(url);
+  }
+
+  static remove(baseUrl, row, qty) {
+    this._assertUrl(baseUrl);
+    this._assertRate();
+    return this.imgReq(`${baseUrl}?action=remove&row=${row}&qty=${qty}`);
+  }
+
+  static addProduct(baseUrl, { name, prezzo, costo, icon }) {
+    this._assertUrl(baseUrl);
+    this._assertRate();
+    // [FIX 4+5] Valori sanitizzati
+    const safeName   = Validator.sanitizeName(name);
+    const safePrezzo = Validator.sanitizePrice(prezzo);
+    const safeCosto  = Validator.sanitizePrice(costo) ?? 0;
+    if (!safeName) throw new Error('Nome non valido');
+    if (safePrezzo === null) throw new Error('Prezzo non valido');
+    return this.imgReq(`${baseUrl}?action=addProduct&name=${encodeURIComponent(safeName)}&prezzo=${safePrezzo}&costo=${safeCosto}&icon=${encodeURIComponent(icon)}`);
+  }
+
+  static updateProduct(baseUrl, { row, prezzo, costo, icon }) {
+    this._assertUrl(baseUrl);
+    this._assertRate();
+    // [FIX 4] Valida prezzi prima di inviare
+    const safePrezzo = Validator.sanitizePrice(prezzo);
+    const safeCosto  = Validator.sanitizePrice(costo) ?? 0;
+    if (safePrezzo === null) throw new Error('Prezzo non valido');
+    return this.imgReq(`${baseUrl}?action=updateProduct&row=${row}&prezzo=${safePrezzo}&costo=${safeCosto}&icon=${encodeURIComponent(icon)}`);
+  }
+
+  static deleteProduct(baseUrl, row) {
+    this._assertUrl(baseUrl);
+    this._assertRate();
+    return this.imgReq(`${baseUrl}?action=deleteProduct&row=${row}`);
+  }
+}
+
+// ─────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────
+const EMOJIS = ['💀','🌿','🥣','🪨','🔘','🛍️','📦','🎁','⭐','🔥','💎','🎯','🧪','🪴','🧲','🎪','🧸','🪆','🍃','🌊','🧊','🌙','☀️','🪄','🎭','🎨','🦋','🌸','🐉','🌀'];
+
+const fmt = n => { const v = parseFloat(n); return isNaN(v) ? '0,00' : v.toFixed(2).replace('.', ','); };
+
+// ─────────────────────────────────────────────
+// Shared styles (inline, avoids global CSS conflicts)
+// ─────────────────────────────────────────────
+const S = {
+  card: { background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem', marginBottom:10 },
+  input: { width:'100%', background:'var(--surface2)', border:'1px solid var(--border)', borderRadius:10, padding:'10px 12px', fontSize:14, color:'var(--text)', outline:'none', fontFamily:'DM Sans, sans-serif', boxSizing:'border-box' },
+  btnGreen: { background:'var(--accent)', color:'#000', border:'none', borderRadius:10, padding:'12px', fontSize:14, fontWeight:600, cursor:'pointer', width:'100%', fontFamily:'DM Sans, sans-serif', marginTop:6 },
+  btnGray: { background:'var(--surface2)', color:'var(--muted)', border:'none', borderRadius:10, padding:'12px', fontSize:14, fontWeight:600, cursor:'pointer', width:'100%', fontFamily:'DM Sans, sans-serif', marginTop:6 },
+  label: { fontSize:11, textTransform:'uppercase', letterSpacing:'0.8px', color:'var(--muted)', display:'block', marginBottom:8 },
+};
+
+// ─────────────────────────────────────────────
+// Components
+// ─────────────────────────────────────────────
+
+function IconPicker({ value, onChange }) {
+  return (
+    <div>
+      <span style={S.label}>Icona</span>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:6, marginBottom:10 }}>
+        {EMOJIS.map(em => (
+          <button key={em} type="button" onClick={() => onChange(em)} style={{
+            height:44, background: em === value ? 'var(--accent-dim)' : 'var(--surface2)',
+            border: `1.5px solid ${em === value ? 'var(--accent)' : 'transparent'}`,
+            borderRadius:10, fontSize:18, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center',
+            transition:'border-color .12s, background .12s'
+          }}>{em}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ msg, type }) {
+  if (!msg) return null;
+  const colors = {
+    success: { background:'var(--accent-dim)', color:'var(--accent)' },
+    error:   { background:'var(--danger-dim)', color:'var(--danger)' },
+    info:    { background:'var(--blue-dim)',   color:'var(--blue)' },
+  };
+  return (
+    <div style={{ marginTop:10, padding:'10px 14px', borderRadius:10, fontSize:13, fontWeight:500, textAlign:'center', ...colors[type] }}>
+      {msg}
+    </div>
+  );
+}
+
+function Skeleton({ count = 3 }) {
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+      {Array.from({ length: count }).map((_, i) => (
+        <div key={i} style={{ background:'var(--surface2)', borderRadius:14, height:72, animation:'pulse 1.2s ease-in-out infinite' }} />
+      ))}
+    </div>
+  );
+}
+
+function StatGrid({ products }) {
+  const lordo  = products.reduce((s, p) => s + p.gross, 0);
+  const netto  = products.reduce((s, p) => s + p.net,   0);
+  const pezzi  = products.reduce((s, p) => s + p.venduti, 0);
+  const stats  = [
+    { label:'Guadagno lordo', value:`€ ${fmt(lordo)}`,  color:'var(--accent)' },
+    { label:'Guadagno netto', value:`€ ${fmt(netto)}`,  color:'var(--warning)' },
+    { label:'Pezzi venduti',  value:pezzi,              color:'var(--blue)' },
+    { label:'Prodotti',       value:products.length,    color:'var(--text)' },
+  ];
+  return (
+    <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:'1.25rem' }}>
+      {stats.map(s => (
+        <div key={s.label} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem' }}>
+          <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.8px', color:'var(--muted)', marginBottom:6 }}>{s.label}</div>
+          <div style={{ fontSize:20, fontWeight:600, fontFamily:'DM Mono, monospace', color:s.color }}>{s.value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─────────── TAB: VENDI ───────────
+function SellTab({ products, loading, onSell, onRemove }) {
+  const [selectedRow, setSelectedRow] = useState(null);
+  const [qty, setQty]   = useState(1);
+  const [buyer, setBuyer] = useState('');
+  const [sending, setSending] = useState(false);
+  const [status, setStatus]   = useState({ msg:'', type:'' });
+  const panelRef = useRef(null);
+
+  const selected = products.find(p => p.row === selectedRow) || null;
+
+  function select(p) {
+    setSelectedRow(p.row);
+    setQty(1);
+    setBuyer('');
+    setStatus({ msg:'', type:'' });
+    setTimeout(() => panelRef.current?.scrollIntoView({ behavior:'smooth', block:'nearest' }), 60);
+  }
+
+  async function handleSell() {
+    if (!selected || qty < 1) return;
+    setSending(true);
+    try {
+      await onSell(selected, qty, buyer);
+      setStatus({ msg:`✓ +${qty} vendita/e${buyer ? ` → ${Validator.sanitizeBuyer(buyer)}` : ''}`, type:'success' });
+      setQty(1); setBuyer('');
+    } catch(e) {
+      setStatus({ msg: e.message || 'Errore', type:'error' });
+    }
+    setSending(false);
+  }
+
+  async function handleRemove() {
+    if (!selected || selected.venduti < 1) return;
+    const actual = Math.min(qty, selected.venduti);
+    setSending(true);
+    try {
+      await onRemove(selected, actual);
+      setStatus({ msg:`− ${actual} rimoss${actual === 1 ? 'a' : 'e'}`, type:'info' });
+      setQty(1);
+    } catch(e) {
+      setStatus({ msg: e.message || 'Errore', type:'error' });
+    }
+    setSending(false);
+  }
+
+  return (
+    <div>
+      <StatGrid products={products} />
+      <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.8px', color:'var(--muted)', marginBottom:10 }}>Prodotti</div>
+
+      {loading && products.length === 0 ? <Skeleton /> :
+       products.length === 0 ? <div style={{ textAlign:'center', padding:'2rem', color:'var(--muted)' }}>Nessun prodotto. Vai in Impostazioni.</div> :
+       <div style={{ display:'flex', flexDirection:'column', gap:8, marginBottom:'1.25rem' }}>
+         {products.map((p, i) => {
+           const sel = p.row === selectedRow;
+           return (
+             <div key={p.row} onClick={() => select(p)} style={{
+               background: sel ? 'var(--accent-dim)' : 'var(--surface)',
+               border: `1px solid ${sel ? 'var(--accent)' : 'var(--border)'}`,
+               borderRadius:14, padding:'1rem', display:'flex', alignItems:'center', gap:12,
+               cursor:'pointer', WebkitTapHighlightColor:'transparent',
+               animation:`fadeIn 0.3s ease ${i*0.04}s both`
+             }}>
+               <div style={{ width:44, height:44, background: sel ? 'rgba(0,230,138,.15)' : 'var(--surface2)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, fontSize:18 }}>{p.icon}</div>
+               <div style={{ flex:1, minWidth:0 }}>
+                 <div style={{ fontSize:15, fontWeight:500, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{p.name}</div>
+                 <div style={{ fontSize:12, color:'var(--muted)', marginTop:2, fontFamily:'DM Mono, monospace' }}>€ {fmt(p.prezzo)} · venduti: {p.venduti}</div>
+               </div>
+               <div style={{ width:20, height:20, borderRadius:'50%', border:`1.5px solid ${sel ? 'var(--accent)' : 'var(--border2)'}`, background: sel ? 'var(--accent)' : 'transparent', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center' }}>
+                 {sel && <div style={{ width:7, height:7, background:'#000', borderRadius:'50%' }} />}
+               </div>
+             </div>
+           );
+         })}
+       </div>
+      }
+
+      {selected && (
+        <div ref={panelRef} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1.25rem', marginBottom:'1rem' }}>
+          <div style={{ fontSize:13, color:'var(--muted)', marginBottom:14 }}>Quantità — <strong style={{ color:'var(--text)' }}>{selected.name} — € {fmt(selected.prezzo)}</strong></div>
+          <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
+            <button onClick={() => setQty(q => Math.max(1, q - 1))} style={{ width:48, height:48, borderRadius:12, border:'1px solid var(--border2)', background:'var(--surface2)', color:'var(--text)', fontSize:22, cursor:'pointer', flexShrink:0 }}>−</button>
+            <input type="number" value={qty} min={1} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))}
+              style={{ flex:1, textAlign:'center', fontSize:28, fontWeight:600, fontFamily:'DM Mono, monospace', background:'var(--surface2)', border:'1px solid var(--border)', borderRadius:12, padding:10, color:'var(--text)', outline:'none', minWidth:0 }} />
+            <button onClick={() => setQty(q => q + 1)} style={{ width:48, height:48, borderRadius:12, border:'1px solid var(--border2)', background:'var(--surface2)', color:'var(--text)', fontSize:22, cursor:'pointer', flexShrink:0 }}>+</button>
+          </div>
+          <div style={{ marginBottom:12 }}>
+            <input type="text" value={buyer} onChange={e => setBuyer(e.target.value)} placeholder="Acquirente (opzionale)"
+              style={{ ...S.input }} autoComplete="off" />
+          </div>
+          <div style={{ display:'flex', gap:8 }}>
+            <button onClick={handleSell} disabled={sending} style={{ flex:2, padding:15, borderRadius:12, border:'none', background: sending ? 'var(--surface2)' : 'var(--accent)', color: sending ? 'var(--muted)' : '#000', fontSize:15, fontWeight:600, cursor: sending ? 'default' : 'pointer', fontFamily:'DM Sans, sans-serif' }}>
+              {sending ? '...' : '+ Registra'}
+            </button>
+            <button onClick={handleRemove} disabled={sending || selected.venduti < 1} style={{ flex:1, padding:15, borderRadius:12, border:'none', background:'var(--danger-dim)', color:'var(--danger)', fontSize:15, fontWeight:600, cursor: (sending || selected.venduti < 1) ? 'default' : 'pointer', opacity: selected.venduti < 1 ? 0.4 : 1, fontFamily:'DM Sans, sans-serif' }}>
+              − Rimuovi
+            </button>
+          </div>
+          <StatusBadge {...status} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────── TAB: GESTISCI ───────────
+function ManageTab({ products, loading, baseUrl, onRefresh }) {
+  const [newName,   setNewName]   = useState('');
+  const [newPrezzo, setNewPrezzo] = useState('');
+  const [newCosto,  setNewCosto]  = useState('');
+  const [newIcon,   setNewIcon]   = useState(EMOJIS[0]);
+  const [addBusy,   setAddBusy]   = useState(false);
+  const [addStatus, setAddStatus] = useState({ msg:'', type:'' });
+
+  const [editProduct, setEditProduct] = useState(null); // Product | null
+  const [editPrezzo,  setEditPrezzo]  = useState('');
+  const [editCosto,   setEditCosto]   = useState('');
+  const [editIcon,    setEditIcon]    = useState('📦');
+  const [editBusy,    setEditBusy]    = useState(false);
+  const [editStatus,  setEditStatus]  = useState({ msg:'', type:'' });
+  const editRef = useRef(null);
+
+  // ESC closes edit
+  useEffect(() => {
+    const handler = e => { if (e.key === 'Escape' && editProduct) closeEdit(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [editProduct]);
+
+  function openEdit(p) {
+    setEditProduct(p);
+    setEditPrezzo(String(p.prezzo));
+    setEditCosto(String(p.costo));
+    setEditIcon(p.icon);
+    setEditStatus({ msg:'', type:'' });
+    setTimeout(() => editRef.current?.scrollIntoView({ behavior:'smooth', block:'nearest' }), 60);
+  }
+
+  function closeEdit() {
+    setEditProduct(null);
+    setEditStatus({ msg:'', type:'' });
+  }
+
+  async function handleAdd() {
+    const safeName   = Validator.sanitizeName(newName);
+    const safePrezzo = Validator.sanitizePrice(newPrezzo);
+    if (!safeName)            { setAddStatus({ msg:'Nome non valido', type:'error' }); return; }
+    if (safePrezzo === null)  { setAddStatus({ msg:'Prezzo non valido (deve essere ≥ 0)', type:'error' }); return; }
+    setAddBusy(true);
+    try {
+      await ApiService.addProduct(baseUrl, { name:safeName, prezzo:safePrezzo, costo:newCosto, icon:newIcon });
+      setAddStatus({ msg:`✓ ${safeName} ${newIcon} aggiunto!`, type:'success' });
+      setNewName(''); setNewPrezzo(''); setNewCosto(''); setNewIcon(EMOJIS[0]);
+      setTimeout(() => onRefresh(true), 800);
+    } catch(e) {
+      setAddStatus({ msg: e.message || 'Errore', type:'error' });
+    }
+    setAddBusy(false);
+  }
+
+  async function handleSaveEdit() {
+    if (!editProduct) return;
+    const safePrezzo = Validator.sanitizePrice(editPrezzo);
+    if (safePrezzo === null) { setEditStatus({ msg:'Prezzo non valido', type:'error' }); return; }
+    setEditBusy(true);
+    try {
+      await ApiService.updateProduct(baseUrl, { row:editProduct.row, prezzo:safePrezzo, costo:editCosto, icon:editIcon });
+      setEditStatus({ msg:'✓ Modificato', type:'success' });
+      setTimeout(() => { closeEdit(); onRefresh(true); }, 600);
+    } catch(e) {
+      setEditStatus({ msg: e.message || 'Errore', type:'error' });
+    }
+    setEditBusy(false);
+  }
+
+  async function handleDelete(p) {
+    if (!window.confirm(`Eliminare "${p.name}" dal foglio?`)) return;
+    await ApiService.deleteProduct(baseUrl, p.row);
+    onRefresh();
+  }
+
+  const formInput = (val, set, placeholder, type='text', extra={}) => (
+    <input type={type} value={val} onChange={e => set(e.target.value)} placeholder={placeholder}
+      step={type==='number' ? '0.01' : undefined} min={type==='number' ? '0' : undefined}
+      style={{ ...S.input, width:0, flex:1 }} {...extra} />
+  );
+
+  return (
+    <div>
+      {/* ADD FORM */}
+      <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden' }}>
+        <div style={{ fontSize:14, fontWeight:600, marginBottom:'1rem' }}>➕ Aggiungi prodotto</div>
+        <IconPicker value={newIcon} onChange={setNewIcon} />
+        <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+          {formInput(newName, setNewName, 'Nome prodotto')}
+        </div>
+        <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+          {formInput(newPrezzo, setNewPrezzo, 'Prezzo (€)', 'number')}
+          {formInput(newCosto,  setNewCosto,  'Costo (€)',  'number')}
+        </div>
+        <button onClick={handleAdd} disabled={addBusy} style={{ ...S.btnGreen, opacity: addBusy ? 0.6 : 1 }}>
+          {addBusy ? 'Aggiunta...' : 'Aggiungi al foglio'}
+        </button>
+        <StatusBadge {...addStatus} />
+      </div>
+
+      {/* EDIT FORM */}
+      {editProduct && (
+        <div ref={editRef} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden' }}>
+          <div style={{ fontSize:14, fontWeight:600, marginBottom:'1rem' }}>✏️ Modifica — {editProduct.name}</div>
+          <IconPicker value={editIcon} onChange={setEditIcon} />
+          <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+            <input value={editProduct.name} disabled style={{ ...S.input, width:0, flex:1, opacity:0.5 }} />
+          </div>
+          <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+            {formInput(editPrezzo, setEditPrezzo, 'Prezzo (€)', 'number')}
+            {formInput(editCosto,  setEditCosto,  'Costo (€)',  'number')}
+          </div>
+          <button onClick={handleSaveEdit} disabled={editBusy} style={{ ...S.btnGreen, opacity: editBusy ? 0.6 : 1 }}>
+            {editBusy ? 'Salvataggio...' : 'Salva modifiche'}
+          </button>
+          <button onClick={closeEdit} style={S.btnGray}>Annulla (ESC)</button>
+          <StatusBadge {...editStatus} />
+        </div>
+      )}
+
+      {/* PRODUCT LIST */}
+      <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.8px', color:'var(--muted)', marginBottom:10 }}>Prodotti esistenti</div>
+      {loading && products.length === 0 ? <Skeleton count={2} /> :
+       products.length === 0 ? <div style={{ textAlign:'center', padding:'2rem', color:'var(--muted)' }}>Nessun prodotto</div> :
+       <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+         {products.map((p, i) => (
+           <div key={p.row} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem', display:'flex', alignItems:'center', gap:12, animation:`fadeIn 0.3s ease ${i*0.04}s both` }}>
+             <div style={{ width:44, height:44, background:'var(--surface2)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, fontSize:18 }}>{p.icon}</div>
+             <div style={{ flex:1, minWidth:0 }}>
+               <div style={{ fontSize:15, fontWeight:500, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{p.name}</div>
+               <div style={{ fontSize:12, color:'var(--muted)', marginTop:2, fontFamily:'DM Mono, monospace' }}>€ {fmt(p.prezzo)} · venduti: {p.venduti}</div>
+             </div>
+             <div style={{ display:'flex', gap:6 }}>
+               <button onClick={() => openEdit(p)} style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer', border:'none', background:'var(--blue-dim)', color:'var(--blue)', fontFamily:'DM Sans, sans-serif' }}>✏️</button>
+               <button onClick={() => handleDelete(p)} style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer', border:'none', background:'var(--surface2)', color:'var(--muted)', fontFamily:'DM Sans, sans-serif' }}>🗑️</button>
+             </div>
+           </div>
+         ))}
+       </div>
+      }
+    </div>
+  );
+}
+
+// ─────────── TAB: IMPOSTAZIONI ───────────
+function SettingsTab({ currentUrl, onSave }) {
+  const [url, setUrl]       = useState(currentUrl);
+  const [saved, setSaved]   = useState(!!currentUrl);
+  const [error, setError]   = useState('');
+
+  function handleSave() {
+    const trimmed = url.trim();
+    if (!trimmed) { setError('Inserisci un URL'); return; }
+    // [FIX 1] Valida prima di salvare
+    if (!Validator.isValidScriptUrl(trimmed)) {
+      setError('URL non valido. Deve essere https://script.google.com/macros/s/...');
+      return;
+    }
+    setError('');
+    onSave(trimmed);
+    setSaved(true);
+  }
+
+  return (
+    <div>
+      <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem' }}>
+        <span style={S.label}>URL Google Apps Script</span>
+        <div style={{ display:'flex', gap:8 }}>
+          <input type="url" value={url} onChange={e => { setUrl(e.target.value); setSaved(false); setError(''); }}
+            placeholder="https://script.google.com/macros/s/..."
+            style={{ ...S.input, fontFamily:'DM Mono, monospace', fontSize:13, flex:1, width:0, borderColor: error ? 'var(--danger)' : undefined }} />
+          <button onClick={handleSave} style={{ background:'var(--accent)', color:'#000', border:'none', borderRadius:10, padding:'10px 16px', fontSize:13, fontWeight:600, cursor:'pointer', whiteSpace:'nowrap' }}>Salva</button>
+        </div>
+        {error  && <div style={{ fontSize:11, color:'var(--danger)', marginTop:6 }}>⚠ {error}</div>}
+        {saved && !error && <div style={{ fontSize:11, color:'var(--accent)', marginTop:6 }}>✓ URL salvato</div>}
+        <div style={{ fontSize:11, color:'var(--muted)', marginTop:8, lineHeight:1.5 }}>
+          Solo URL <code style={{ color:'var(--accent)' }}>script.google.com</code> sono accettati.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────── APP ROOT ───────────
+function App() {
+  const [tab,      setTab]      = useState('sell');
+  const [products, setProducts] = useState(() => ProductStore.load());
+  const [loading,  setLoading]  = useState(false);
+  const [spinning, setSpinning] = useState(false);
+  const [baseUrl,  setBaseUrl]  = useState(() => ProductStore.getUrl());
+
+  // Load on mount if URL exists
+  useEffect(() => { if (baseUrl) fetchProducts(!!products.length); }, []);
+
+  async function fetchProducts(silent = false) {
+    if (!baseUrl) return;
+    setSpinning(true);
+    if (!silent) setLoading(true);
+    try {
+      const data = await ApiService.fetchProducts(baseUrl);
+      setProducts(data);
+      ProductStore.save(data);
+    } catch (e) {
+      console.error('Fetch products:', e);
+    }
+    setLoading(false);
+    setSpinning(false);
+  }
+
+  function handleSaveUrl(url) {
+    ProductStore.setUrl(url);
+    setBaseUrl(url);
+    fetchProducts(false);
+  }
+
+  async function handleSell(product, qty, buyer) {
+    await ApiService.sell(baseUrl, product.row, qty, buyer);
+    setProducts(prev => {
+      const next = prev.map(p => p.row === product.row ? p.withVenduti(qty) : p);
+      ProductStore.save(next);
+      return next;
+    });
+  }
+
+  async function handleRemove(product, qty) {
+    await ApiService.remove(baseUrl, product.row, qty);
+    setProducts(prev => {
+      const next = prev.map(p => p.row === product.row ? p.withVenduti(-qty) : p);
+      ProductStore.save(next);
+      return next;
+    });
+  }
+
+  const TABS = [
+    { id:'sell',     label:'Vendi' },
+    { id:'manage',   label:'Gestisci' },
+    { id:'settings', label:'Impostazioni' },
+  ];
+
+  return (
+    <div style={{ maxWidth:'100vw', overflowX:'hidden' }}>
+      {/* HEADER */}
+      <header style={{ padding:'1.5rem 1.25rem 1rem', borderBottom:'1px solid var(--border)', position:'sticky', top:0, background:'var(--bg)', zIndex:20, display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:12, minWidth:0 }}>
+          <svg width="36" height="36" viewBox="0 0 512 512" fill="none" style={{ background:'#1a1a1a', padding:7, borderRadius:10, border:'1px solid rgba(255,255,255,0.1)', flexShrink:0 }}>
+            <path d="M160 160H384L360 320H184L160 160Z" stroke="#00e68a" strokeWidth="32" strokeLinejoin="round"/>
+            <path d="M140 160L120 100H80" stroke="#00e68a" strokeWidth="32" strokeLinecap="round" strokeLinejoin="round"/>
+            <circle cx="200" cy="380" r="24" fill="#00e68a"/>
+            <circle cx="344" cy="380" r="24" fill="#00e68a"/>
+            <path d="M220 280L260 220L300 250L340 180" stroke="#4d9fff" strokeWidth="20" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <h1 style={{ fontSize:19, fontWeight:600, letterSpacing:'-0.5px', whiteSpace:'nowrap' }}>Vendite Pro</h1>
+        </div>
+        <button onClick={() => fetchProducts(false)} style={{ width:36, height:36, borderRadius:10, border:'1px solid var(--border2)', background:'var(--surface)', color:'var(--text)', fontSize:15, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, animation: spinning ? 'spin 0.7s linear infinite' : 'none' }}>↻</button>
+      </header>
+
+      {/* TABS */}
+      <div style={{ display:'flex', padding:'0.75rem 1.25rem 0', gap:6, borderBottom:'1px solid var(--border)' }}>
+        {TABS.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ padding:'8px 16px', borderRadius:'10px 10px 0 0', fontSize:13, fontWeight:500, cursor:'pointer', color: tab===t.id ? 'var(--accent)' : 'var(--muted)', background: tab===t.id ? 'var(--accent-dim)' : 'transparent', border:'none', WebkitTapHighlightColor:'transparent' }}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* CONTENT */}
+      <div style={{ padding:'1rem 1.25rem', maxWidth:'100%', overflowX:'hidden' }}>
+        {tab === 'sell'     && <SellTab     products={products} loading={loading} onSell={handleSell} onRemove={handleRemove} />}
+        {tab === 'manage'   && <ManageTab   products={products} loading={loading} baseUrl={baseUrl} onRefresh={fetchProducts} />}
+        {tab === 'settings' && <SettingsTab currentUrl={baseUrl} onSave={handleSaveUrl} />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
