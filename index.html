@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Vendite Pro</title>
+<title>3D Pull Ups</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="icon" type="image/png" href="public/icon.png">
 <link rel="apple-touch-icon" href="public/icon.png">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { max-width: 100%; overflow-x: hidden; }
+  html, body { max-width: 100%; overflow-x: hidden; user-select: none;}
   :root {
     --bg:#0d0d0d; --surface:#1a1a1a; --surface2:#242424; --surface3:#2e2e2e;
     --border:rgba(255,255,255,0.08); --border2:rgba(255,255,255,0.15);
@@ -705,7 +705,7 @@ function App() {
             <circle cx="344" cy="380" r="24" fill="#00e68a"/>
             <path d="M220 280L260 220L300 250L340 180" stroke="#4d9fff" strokeWidth="20" strokeLinecap="round" strokeLinejoin="round"/>
           </svg>
-          <h1 style={{ fontSize:19, fontWeight:600, letterSpacing:'-0.5px', whiteSpace:'nowrap' }}>Vendite Pro</h1>
+          <h1 style={{ fontSize:19, fontWeight:600, letterSpacing:'-0.5px', whiteSpace:'nowrap' }}>3D Pull Ups</h1>
         </div>
         <button onClick={() => fetchProducts(false)} style={{ width:36, height:36, borderRadius:10, border:'1px solid var(--border2)', background:'var(--surface)', color:'var(--text)', fontSize:15, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, animation: spinning ? 'spin 0.7s linear infinite' : 'none' }}>↻</button>
       </header>
