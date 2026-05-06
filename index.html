@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://script.google.com https://script.googleusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src https://script.google.com https://script.googleusercontent.com; worker-src 'none'; frame-src 'none'; object-src 'none';">
+<!-- [SEC] CSP: script.googleusercontent.com necessario per redirect JSONP di Apps Script -->
 <title>3D Pull Ups</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="icon" type="image/png" href="public/icon.png">
@@ -25,10 +27,11 @@
   @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
   @keyframes pulse { 0%,100% { opacity:.4; } 50% { opacity:.8; } }
 </style>
-<!-- React + Babel -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<!-- [SEC] Script CDN con crossorigin. Per produzione, aggiungere integrity="sha512-..."
+     calcolato con: curl URL | openssl dgst -sha512 -binary | openssl base64 -A -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -69,6 +72,25 @@ class Validator {
     return String(val).trim().slice(0, 100).replace(/[<>"'`]/g, '');
   }
 
+  // [FIX-ICON] Whitelist: accetta solo emoji dalla lista EMOJIS hardcoded
+  static isValidIcon(icon, allowed) {
+    if (!Array.isArray(allowed)) return false;
+    return typeof icon === 'string' && allowed.includes(icon);
+  }
+
+  // [FIX-ROW] row deve essere intero >= 2
+  static sanitizeRow(val) {
+    const n = parseInt(val, 10);
+    if (isNaN(n) || n < 2) return null;
+    return n;
+  }
+
+  // [FIX-QTY] qty deve essere intero >= 1, max 9999
+  static sanitizeQty(val) {
+    const n = parseInt(val, 10);
+    if (isNaN(n) || n < 1) return null;
+    return Math.min(n, 9999);
+  }
   // [FIX 3] Rate limiter: max N chiamate per intervallo
   static _callLog = [];
   static MAX_CALLS = 10;
@@ -108,8 +130,8 @@ class Product {
 // OOP: ProductStore (cache in localStorage)
 // ─────────────────────────────────────────────
 class ProductStore {
-  static KEY = 'vp_products_v2';
-  static URL_KEY = 'scriptUrl';
+  static KEY = '3dpullups_products_v2';
+  static URL_KEY = '3dpullups_scriptUrl';
 
   // [FIX 6] Valida ogni campo prima di accettare dati da localStorage
   static _validate(obj) {
@@ -201,13 +223,15 @@ class ApiService {
     });
   }
 
+  // [FIX-IMG] Fire-and-forget via script tag (funziona su file://, rispetta la CSP,
+  // stesso meccanismo del JSONP — nessun errore CORS in console)
   static imgReq(url) {
-    return new Promise(resolve => {
-      const img = new Image();
-      img.onload = img.onerror = resolve;
-      img.src = url + '&_t=' + Date.now();
-      setTimeout(resolve, 5000);
-    });
+    const fullUrl = url + '&_t=' + Date.now();
+    const s = document.createElement('script');
+    s.src = fullUrl;
+    s.onload = s.onerror = () => s.remove();
+    document.head.appendChild(s);
+    return Promise.resolve();
   }
 
   static async fetchProducts(baseUrl) {
@@ -219,9 +243,12 @@ class ApiService {
   static sell(baseUrl, row, qty, buyer = '') {
     this._assertUrl(baseUrl);
     this._assertRate();
-    // [FIX 5] Buyer sanitizzato
+    const safeRow = Validator.sanitizeRow(row);
+    const safeQty = Validator.sanitizeQty(qty);
+    if (safeRow === null) throw new Error('Riga non valida');
+    if (safeQty === null) throw new Error('Quantità non valida');
     const safeBuyer = Validator.sanitizeBuyer(buyer);
-    let url = `${baseUrl}?action=sell&row=${row}&qty=${qty}`;
+    let url = `${baseUrl}?action=sell&row=${safeRow}&qty=${safeQty}`;
     if (safeBuyer) url += `&buyer=${encodeURIComponent(safeBuyer)}`;
     return this.imgReq(url);
   }
@@ -229,35 +256,44 @@ class ApiService {
   static remove(baseUrl, row, qty) {
     this._assertUrl(baseUrl);
     this._assertRate();
-    return this.imgReq(`${baseUrl}?action=remove&row=${row}&qty=${qty}`);
+    const safeRow = Validator.sanitizeRow(row);
+    const safeQty = Validator.sanitizeQty(qty);
+    if (safeRow === null) throw new Error('Riga non valida');
+    if (safeQty === null) throw new Error('Quantità non valida');
+    return this.imgReq(`${baseUrl}?action=remove&row=${safeRow}&qty=${safeQty}`);
   }
 
-  static addProduct(baseUrl, { name, prezzo, costo, icon }) {
+  static addProduct(baseUrl, { name, prezzo, costo, icon }, allowedIcons) {
     this._assertUrl(baseUrl);
     this._assertRate();
-    // [FIX 4+5] Valori sanitizzati
     const safeName   = Validator.sanitizeName(name);
     const safePrezzo = Validator.sanitizePrice(prezzo);
     const safeCosto  = Validator.sanitizePrice(costo) ?? 0;
+    // [FIX-ICON] Verifica che l'icona sia nella whitelist
+    if (!Validator.isValidIcon(icon, allowedIcons)) throw new Error('Icona non valida');
     if (!safeName) throw new Error('Nome non valido');
     if (safePrezzo === null) throw new Error('Prezzo non valido');
     return this.imgReq(`${baseUrl}?action=addProduct&name=${encodeURIComponent(safeName)}&prezzo=${safePrezzo}&costo=${safeCosto}&icon=${encodeURIComponent(icon)}`);
   }
 
-  static updateProduct(baseUrl, { row, prezzo, costo, icon }) {
+  static updateProduct(baseUrl, { row, prezzo, costo, icon }, allowedIcons) {
     this._assertUrl(baseUrl);
     this._assertRate();
-    // [FIX 4] Valida prezzi prima di inviare
+    const safeRow    = Validator.sanitizeRow(row);
     const safePrezzo = Validator.sanitizePrice(prezzo);
     const safeCosto  = Validator.sanitizePrice(costo) ?? 0;
+    if (safeRow === null) throw new Error('Riga non valida');
     if (safePrezzo === null) throw new Error('Prezzo non valido');
-    return this.imgReq(`${baseUrl}?action=updateProduct&row=${row}&prezzo=${safePrezzo}&costo=${safeCosto}&icon=${encodeURIComponent(icon)}`);
+    if (!Validator.isValidIcon(icon, allowedIcons)) throw new Error('Icona non valida');
+    return this.imgReq(`${baseUrl}?action=updateProduct&row=${safeRow}&prezzo=${safePrezzo}&costo=${safeCosto}&icon=${encodeURIComponent(icon)}`);
   }
 
   static deleteProduct(baseUrl, row) {
     this._assertUrl(baseUrl);
     this._assertRate();
-    return this.imgReq(`${baseUrl}?action=deleteProduct&row=${row}`);
+    const safeRow = Validator.sanitizeRow(row);
+    if (safeRow === null) throw new Error('Riga non valida');
+    return this.imgReq(`${baseUrl}?action=deleteProduct&row=${safeRow}`);
   }
 }
 
@@ -355,6 +391,7 @@ function SellTab({ products, loading, onSell, onRemove }) {
   const [sending, setSending] = useState(false);
   const [status, setStatus]   = useState({ msg:'', type:'' });
   const panelRef = useRef(null);
+  const seenRows = useRef(new Set());
 
   const selected = products.find(p => p.row === selectedRow) || null;
 
@@ -401,15 +438,17 @@ function SellTab({ products, loading, onSell, onRemove }) {
       {loading && products.length === 0 ? <Skeleton /> :
        products.length === 0 ? <div style={{ textAlign:'center', padding:'2rem', color:'var(--muted)' }}>Nessun prodotto. Vai in Impostazioni.</div> :
        <div style={{ display:'flex', flexDirection:'column', gap:8, marginBottom:'1.25rem' }}>
-         {products.map((p, i) => {
+         {products.map((p) => {
            const sel = p.row === selectedRow;
+           const isNew = !seenRows.current.has(p.row);
+           if (isNew) seenRows.current.add(p.row);
            return (
              <div key={p.row} onClick={() => select(p)} style={{
                background: sel ? 'var(--accent-dim)' : 'var(--surface)',
                border: `1px solid ${sel ? 'var(--accent)' : 'var(--border)'}`,
                borderRadius:14, padding:'1rem', display:'flex', alignItems:'center', gap:12,
                cursor:'pointer', WebkitTapHighlightColor:'transparent',
-               animation:`fadeIn 0.3s ease ${i*0.04}s both`
+               animation: isNew ? 'fadeIn 0.3s ease both' : 'none'
              }}>
                <div style={{ width:44, height:44, background: sel ? 'rgba(0,230,138,.15)' : 'var(--surface2)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, fontSize:18 }}>{p.icon}</div>
                <div style={{ flex:1, minWidth:0 }}>
@@ -454,7 +493,8 @@ function SellTab({ products, loading, onSell, onRemove }) {
 }
 
 // ─────────── TAB: GESTISCI ───────────
-function ManageTab({ products, loading, baseUrl, onRefresh }) {
+function ManageTab({ products, loading, baseUrl, onRefresh, onProductAdd, onProductUpdate, onProductDelete }) {
+  const [showAddForm, setShowAddForm] = useState(false);
   const [newName,   setNewName]   = useState('');
   const [newPrezzo, setNewPrezzo] = useState('');
   const [newCosto,  setNewCosto]  = useState('');
@@ -469,15 +509,37 @@ function ManageTab({ products, loading, baseUrl, onRefresh }) {
   const [editBusy,    setEditBusy]    = useState(false);
   const [editStatus,  setEditStatus]  = useState({ msg:'', type:'' });
   const editRef = useRef(null);
+  const addFormRef = useRef(null);
+  // Tiene traccia dei row già renderizzati: anima solo i prodotti nuovi
+  const seenRows = useRef(new Set());
 
-  // ESC closes edit
+  // ESC closes edit or add form; Enter on add form submits
   useEffect(() => {
-    const handler = e => { if (e.key === 'Escape' && editProduct) closeEdit(); };
+    const handler = e => {
+      if (e.key === 'Escape') {
+        if (editProduct) { closeEdit(); return; }
+        if (showAddForm) { closeAddForm(); return; }
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        if (addFormRef.current && addFormRef.current.contains(document.activeElement) && !addBusy) {
+          e.preventDefault();
+          handleAdd();
+        }
+      }
+    };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [editProduct]);
+  }, [editProduct, showAddForm, addBusy, newName, newPrezzo, newCosto, newIcon]);
+
+  function closeAddForm() {
+    setShowAddForm(false);
+    setNewName(''); setNewPrezzo(''); setNewCosto(''); setNewIcon(EMOJIS[0]);
+    setAddStatus({ msg:'', type:'' });
+  }
 
   function openEdit(p) {
+    // Blocca se c'è già un edit aperto
+    if (editProduct) return;
     setEditProduct(p);
     setEditPrezzo(String(p.prezzo));
     setEditCosto(String(p.costo));
@@ -494,16 +556,23 @@ function ManageTab({ products, loading, baseUrl, onRefresh }) {
   async function handleAdd() {
     const safeName   = Validator.sanitizeName(newName);
     const safePrezzo = Validator.sanitizePrice(newPrezzo);
-    if (!safeName)            { setAddStatus({ msg:'Nome non valido', type:'error' }); return; }
-    if (safePrezzo === null)  { setAddStatus({ msg:'Prezzo non valido (deve essere ≥ 0)', type:'error' }); return; }
+    const safeCosto  = Validator.sanitizePrice(newCosto) ?? 0;
+    if (!safeName)           { setAddStatus({ msg:'Nome non valido', type:'error' }); return; }
+    if (safePrezzo === null) { setAddStatus({ msg:'Prezzo non valido (deve essere ≥ 0)', type:'error' }); return; }
     setAddBusy(true);
+    // Chiudi il form subito
+    setShowAddForm(false);
+    setNewName(''); setNewPrezzo(''); setNewCosto(''); setNewIcon(EMOJIS[0]);
+    setAddStatus({ msg:'', type:'' });
     try {
-      await ApiService.addProduct(baseUrl, { name:safeName, prezzo:safePrezzo, costo:newCosto, icon:newIcon });
-      setAddStatus({ msg:`✓ ${safeName} ${newIcon} aggiunto!`, type:'success' });
-      setNewName(''); setNewPrezzo(''); setNewCosto(''); setNewIcon(EMOJIS[0]);
-      setTimeout(() => onRefresh(true), 800);
+      await ApiService.addProduct(baseUrl, { name:safeName, prezzo:safePrezzo, costo:safeCosto, icon:newIcon }, EMOJIS);
+      // Apps Script impiega qualche secondo a scrivere sul foglio:
+      // primo refresh dopo 3s, secondo dopo 6s per sicurezza
+      setTimeout(() => onRefresh(true), 3000);
+      setTimeout(() => onRefresh(true), 6000);
     } catch(e) {
-      setAddStatus({ msg: e.message || 'Errore', type:'error' });
+      setAddStatus({ msg: e.message || 'Errore aggiunta', type:'error' });
+      setShowAddForm(true);
     }
     setAddBusy(false);
   }
@@ -511,22 +580,29 @@ function ManageTab({ products, loading, baseUrl, onRefresh }) {
   async function handleSaveEdit() {
     if (!editProduct) return;
     const safePrezzo = Validator.sanitizePrice(editPrezzo);
+    const safeCosto  = Validator.sanitizePrice(editCosto) ?? 0;
     if (safePrezzo === null) { setEditStatus({ msg:'Prezzo non valido', type:'error' }); return; }
     setEditBusy(true);
+    // Ottimistic: aggiorna lista locale subito e chiudi
+    const updated = new Product({ ...editProduct.toPlain(), prezzo:safePrezzo, costo:safeCosto, icon:editIcon });
+    onProductUpdate(updated);
+    closeEdit();
     try {
-      await ApiService.updateProduct(baseUrl, { row:editProduct.row, prezzo:safePrezzo, costo:editCosto, icon:editIcon });
-      setEditStatus({ msg:'✓ Modificato', type:'success' });
-      setTimeout(() => { closeEdit(); onRefresh(true); }, 600);
+      await ApiService.updateProduct(baseUrl, { row:editProduct.row, prezzo:safePrezzo, costo:safeCosto, icon:editIcon }, EMOJIS);
     } catch(e) {
-      setEditStatus({ msg: e.message || 'Errore', type:'error' });
+      // In caso di errore server, refresh per ripristinare
+      onRefresh(true);
     }
     setEditBusy(false);
   }
 
   async function handleDelete(p) {
     if (!window.confirm(`Eliminare "${p.name}" dal foglio?`)) return;
-    await ApiService.deleteProduct(baseUrl, p.row);
-    onRefresh();
+    // Ottimistic: rimuovi dalla lista subito
+    onProductDelete(p.row);
+    ApiService.deleteProduct(baseUrl, p.row).catch(() => onRefresh(true));
+    // Refresh ritardato: dopo la cancellazione i row si riscalano nel foglio
+    setTimeout(() => onRefresh(true), 3000);
   }
 
   const formInput = (val, set, placeholder, type='text', extra={}) => (
@@ -535,28 +611,48 @@ function ManageTab({ products, loading, baseUrl, onRefresh }) {
       style={{ ...S.input, width:0, flex:1 }} {...extra} />
   );
 
+  // Lista filtrata: nasconde il prodotto in modifica
+  const visibleProducts = products.filter(p => !editProduct || p.row !== editProduct.row);
+
   return (
     <div>
-      {/* ADD FORM */}
-      <div style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden' }}>
-        <div style={{ fontSize:14, fontWeight:600, marginBottom:'1rem' }}>➕ Aggiungi prodotto</div>
-        <IconPicker value={newIcon} onChange={setNewIcon} />
-        <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
-          {formInput(newName, setNewName, 'Nome prodotto')}
-        </div>
-        <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
-          {formInput(newPrezzo, setNewPrezzo, 'Prezzo (€)', 'number')}
-          {formInput(newCosto,  setNewCosto,  'Costo (€)',  'number')}
-        </div>
-        <button onClick={handleAdd} disabled={addBusy} style={{ ...S.btnGreen, opacity: addBusy ? 0.6 : 1 }}>
-          {addBusy ? 'Aggiunta...' : 'Aggiungi al foglio'}
+      {/* BOTTONE AGGIUNGI */}
+      {!showAddForm && (
+        <button
+          onClick={() => setShowAddForm(true)}
+          style={{ ...S.btnGreen, marginBottom:'1.25rem', display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}
+        >
+          ➕ Aggiungi prodotto
         </button>
-        <StatusBadge {...addStatus} />
-      </div>
+      )}
+
+      {/* ADD FORM (pannello collassabile) */}
+      {showAddForm && (
+        <div ref={addFormRef} style={{ background:'var(--surface)', border:'1px solid var(--accent)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden', animation:'fadeIn 0.2s ease' }}>
+          <div style={{ fontSize:14, fontWeight:600, marginBottom:'1rem' }}>➕ Nuovo prodotto</div>
+          <IconPicker value={newIcon} onChange={setNewIcon} />
+          <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+            {formInput(newName, setNewName, 'Nome prodotto')}
+          </div>
+          <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
+            {formInput(newPrezzo, setNewPrezzo, 'Prezzo (€)', 'number')}
+            {formInput(newCosto,  setNewCosto,  'Costo (€)',  'number')}
+          </div>
+          <div style={{ display:'flex', gap:8 }}>
+            <button onClick={handleAdd} disabled={addBusy} style={{ ...S.btnGreen, marginTop:6, flex:1 }}>
+              {addBusy ? 'Aggiunta...' : 'Aggiungi al foglio'}
+            </button>
+            <button onClick={closeAddForm} disabled={addBusy} style={{ ...S.btnGray, marginTop:6, flex:'0 0 auto', width:'auto', padding:'12px 18px' }}>
+              Annulla (ESC)
+            </button>
+          </div>
+          <StatusBadge {...addStatus} />
+        </div>
+      )}
 
       {/* EDIT FORM */}
       {editProduct && (
-        <div ref={editRef} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden' }}>
+        <div ref={editRef} style={{ background:'var(--surface)', border:'1px solid var(--blue)', borderRadius:14, padding:'1.25rem', marginBottom:'1.25rem', overflow:'hidden', animation:'fadeIn 0.2s ease' }}>
           <div style={{ fontSize:14, fontWeight:600, marginBottom:'1rem' }}>✏️ Modifica — {editProduct.name}</div>
           <IconPicker value={editIcon} onChange={setEditIcon} />
           <div style={{ display:'flex', gap:8, marginBottom:8, minWidth:0, overflow:'hidden' }}>
@@ -577,21 +673,33 @@ function ManageTab({ products, loading, baseUrl, onRefresh }) {
       {/* PRODUCT LIST */}
       <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.8px', color:'var(--muted)', marginBottom:10 }}>Prodotti esistenti</div>
       {loading && products.length === 0 ? <Skeleton count={2} /> :
-       products.length === 0 ? <div style={{ textAlign:'center', padding:'2rem', color:'var(--muted)' }}>Nessun prodotto</div> :
+       visibleProducts.length === 0 && !editProduct ? <div style={{ textAlign:'center', padding:'2rem', color:'var(--muted)' }}>Nessun prodotto</div> :
        <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-         {products.map((p, i) => (
-           <div key={p.row} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem', display:'flex', alignItems:'center', gap:12, animation:`fadeIn 0.3s ease ${i*0.04}s both` }}>
+         {visibleProducts.map((p) => {
+           const isNew = !seenRows.current.has(p.row);
+           if (isNew) seenRows.current.add(p.row);
+           return (
+           <div key={p.row} style={{ background:'var(--surface)', border:'1px solid var(--border)', borderRadius:14, padding:'1rem', display:'flex', alignItems:'center', gap:12, animation: isNew ? 'fadeIn 0.3s ease both' : 'none' }}>
              <div style={{ width:44, height:44, background:'var(--surface2)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, fontSize:18 }}>{p.icon}</div>
              <div style={{ flex:1, minWidth:0 }}>
                <div style={{ fontSize:15, fontWeight:500, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{p.name}</div>
-               <div style={{ fontSize:12, color:'var(--muted)', marginTop:2, fontFamily:'DM Mono, monospace' }}>€ {fmt(p.prezzo)} · venduti: {p.venduti}</div>
+               <div style={{ fontSize:12, color:'var(--muted)', marginTop:2, fontFamily:'DM Mono, monospace' }}>€ {fmt(p.prezzo)} · costo: {fmt(p.costo)} · venduti: {p.venduti}</div>
              </div>
              <div style={{ display:'flex', gap:6 }}>
-               <button onClick={() => openEdit(p)} style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer', border:'none', background:'var(--blue-dim)', color:'var(--blue)', fontFamily:'DM Sans, sans-serif' }}>✏️</button>
-               <button onClick={() => handleDelete(p)} style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor:'pointer', border:'none', background:'var(--surface2)', color:'var(--muted)', fontFamily:'DM Sans, sans-serif' }}>🗑️</button>
+               <button
+                 onClick={() => openEdit(p)}
+                 disabled={!!editProduct}
+                 title={editProduct ? 'Concludi la modifica corrente prima' : 'Modifica'}
+                 style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor: editProduct ? 'not-allowed' : 'pointer', border:'none', background:'var(--blue-dim)', color: editProduct ? 'var(--muted)' : 'var(--blue)', fontFamily:'DM Sans, sans-serif', opacity: editProduct ? 0.4 : 1 }}>✏️</button>
+               <button
+                 onClick={() => handleDelete(p)}
+                 disabled={!!editProduct}
+                 title={editProduct ? 'Concludi la modifica corrente prima' : 'Elimina'}
+                 style={{ padding:'6px 10px', borderRadius:8, fontSize:12, fontWeight:600, cursor: editProduct ? 'not-allowed' : 'pointer', border:'none', background:'var(--surface2)', color:'var(--muted)', fontFamily:'DM Sans, sans-serif', opacity: editProduct ? 0.4 : 1 }}>🗑️</button>
              </div>
            </div>
-         ))}
+           );
+         })}
        </div>
       }
     </div>
@@ -670,18 +778,45 @@ function App() {
   }
 
   async function handleSell(product, qty, buyer) {
-    await ApiService.sell(baseUrl, product.row, qty, buyer);
+    // Ottimistic: aggiorna UI subito, poi manda al server in background
     setProducts(prev => {
       const next = prev.map(p => p.row === product.row ? p.withVenduti(qty) : p);
       ProductStore.save(next);
       return next;
     });
+    ApiService.sell(baseUrl, product.row, qty, buyer).catch(console.error);
   }
 
   async function handleRemove(product, qty) {
-    await ApiService.remove(baseUrl, product.row, qty);
+    // Ottimistic: aggiorna UI subito, poi manda al server in background
     setProducts(prev => {
       const next = prev.map(p => p.row === product.row ? p.withVenduti(-qty) : p);
+      ProductStore.save(next);
+      return next;
+    });
+    ApiService.remove(baseUrl, product.row, qty).catch(console.error);
+  }
+
+  // Chiamato da ManageTab per operazioni che cambiano struttura (add/delete)
+  function handleProductAdd(product) {
+    setProducts(prev => {
+      const next = [...prev, product];
+      ProductStore.save(next);
+      return next;
+    });
+  }
+
+  function handleProductUpdate(updatedProduct) {
+    setProducts(prev => {
+      const next = prev.map(p => p.row === updatedProduct.row ? updatedProduct : p);
+      ProductStore.save(next);
+      return next;
+    });
+  }
+
+  function handleProductDelete(row) {
+    setProducts(prev => {
+      const next = prev.filter(p => p.row !== row);
       ProductStore.save(next);
       return next;
     });
@@ -720,7 +855,7 @@ function App() {
       {/* CONTENT */}
       <div style={{ padding:'1rem 1.25rem', maxWidth:'100%', overflowX:'hidden' }}>
         {tab === 'sell'     && <SellTab     products={products} loading={loading} onSell={handleSell} onRemove={handleRemove} />}
-        {tab === 'manage'   && <ManageTab   products={products} loading={loading} baseUrl={baseUrl} onRefresh={fetchProducts} />}
+        {tab === 'manage'   && <ManageTab   products={products} loading={loading} baseUrl={baseUrl} onRefresh={fetchProducts} onProductAdd={handleProductAdd} onProductUpdate={handleProductUpdate} onProductDelete={handleProductDelete} />}
         {tab === 'settings' && <SettingsTab currentUrl={baseUrl} onSave={handleSaveUrl} />}
       </div>
     </div>
